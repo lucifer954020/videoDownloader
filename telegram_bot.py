@@ -4,6 +4,7 @@ import subprocess
 import asyncio
 import logging
 import shutil
+import time
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -32,7 +33,7 @@ LOG_FILE = "logs.txt"
 MAX_TELEGRAM_SIZE_MB = 50          # Telegram bot upload limit
 MAX_DOWNLOAD_SIZE_MB = 500         # Hard cap: refuse to download larger files
 DOWNLOAD_TIMEOUT_SEC = 300         # 5 minutes per download
-COMPRESS_TIMEOUT_SEC = 300         # 5 minutes per compression
+COMPRESS_TIMEOUT_SEC = 300         # 5 minutes per compression attempt
 ALLOWED_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -58,7 +59,6 @@ def safe_remove(path: str):
 
 def cleanup_dir_old_files(max_age_sec: int = 3600):
     """Remove leftover files older than 1 hour (safety net)."""
-    import time
     now = time.time()
     try:
         for name in os.listdir(DOWNLOAD_DIR):
@@ -74,11 +74,6 @@ def check_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def human_size(size_bytes: int) -> str:
-    mb = size_bytes / (1024 * 1024)
-    return f"{mb:.2f} MB"
-
-
 def is_valid_url(text: str) -> bool:
     if not text:
         return False
@@ -90,7 +85,6 @@ def is_valid_url(text: str) -> bool:
 def download_video(url: str) -> str:
     """Download a video from URL. Returns path to file. Raises on failure."""
     unique_id = str(uuid.uuid4())
-    # Use %(ext)s so yt-dlp picks proper extension
     output_template = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
 
     ydl_opts = {
@@ -118,7 +112,6 @@ def download_video(url: str) -> str:
         if "requested_downloads" in info and info["requested_downloads"]:
             file_path = info["requested_downloads"][0].get("filepath")
         if not file_path or not os.path.exists(file_path):
-            # Fallback: search directory for the newest file with the uuid prefix
             for name in os.listdir(DOWNLOAD_DIR):
                 if name.startswith(unique_id):
                     file_path = os.path.join(DOWNLOAD_DIR, name)
@@ -130,7 +123,6 @@ def download_video(url: str) -> str:
     # Verify extension
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        # Try to convert unsupported container via ffmpeg
         if check_ffmpeg():
             converted = os.path.join(DOWNLOAD_DIR, f"{unique_id}.mp4")
             try:
@@ -166,12 +158,11 @@ def compress_video(file_path: str) -> str:
         return file_path
 
     if not check_ffmpeg():
-        # Cannot compress; we still try to send, but let caller decide
-        return file_path
+        return file_path  # caller will handle "still too big" case
 
     compressed_path = file_path.rsplit(".", 1)[0] + "_compressed.mp4"
 
-    # Two-pass approach: try quality CRF 28 first, then heavier if still too big
+    # Escalating compression attempts
     for crf, scale in [("28", None), ("32", "1280:-2"), ("36", "854:-2")]:
         try:
             cmd = ["ffmpeg", "-y", "-i", file_path, "-vcodec", "libx264", "-crf", crf]
@@ -194,7 +185,6 @@ def compress_video(file_path: str) -> str:
                 safe_remove(file_path)
                 return compressed_path
 
-            # Still too big — remove and try harder next loop
             safe_remove(compressed_path)
 
         except subprocess.TimeoutExpired:
@@ -207,8 +197,7 @@ def compress_video(file_path: str) -> str:
             logger.warning(f"Unexpected compression error: {e}")
             safe_remove(compressed_path)
 
-    # Nothing worked
-    return file_path
+    return file_path  # nothing worked
 
 
 # ---------- HANDLERS ----------
@@ -292,7 +281,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         log_download(url, os.path.basename(file_path), final_mb)
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
     except asyncio.TimeoutError:
         await status_msg.edit_text(
@@ -340,14 +332,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     finally:
-        # Always clean up, even on failure
         if file_path:
             safe_remove(file_path)
-        # Also clean leftovers from previous crashed runs
         cleanup_dir_old_files()
 
 
-# ---------- ERROR HANDLER (for any uncaught update errors) ----------
+# ---------- GLOBAL ERROR HANDLER ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
     if isinstance(context.error, (NetworkError, TimedOut)):
@@ -362,7 +352,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- MAIN ----------
-async def main():
+def main():
     if not check_ffmpeg():
         logger.warning(
             "⚠️ ffmpeg not found on PATH. Compression and merging will fail."
@@ -378,13 +368,12 @@ async def main():
     app.add_error_handler(error_handler)
 
     logger.info("🤖 Video Downloader Bot is running...")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # run_polling is SYNCHRONOUS — do NOT await it, do NOT wrap in asyncio.run
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
-    except Exception as e:
-        logger.exception(f"Fatal error: {e}")
+    main()
