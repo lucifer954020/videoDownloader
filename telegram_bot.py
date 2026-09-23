@@ -2,7 +2,6 @@ import os
 import uuid
 import base64
 import tempfile
-import subprocess
 import asyncio
 import logging
 import shutil
@@ -24,7 +23,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)   # reduce log noise
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ---------- CONFIG ----------
@@ -34,9 +33,12 @@ if not BOT_TOKEN:
 
 DOWNLOAD_DIR = "./downloads"
 MAX_TELEGRAM_SIZE_MB = 50
-DOWNLOAD_TIMEOUT_SEC = 1800   # 30 min for large playlists
+DOWNLOAD_TIMEOUT_SEC = 1800
 MODE_SINGLE = "single"
 MODE_PLAYLIST = "playlist"
+
+# POT provider runs on this port inside the container
+POT_PROVIDER_URL = "http://127.0.0.1:4416"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -118,13 +120,13 @@ def download_audio(url: str, allow_playlist: bool) -> list:
         "socket_timeout": 30,
         "retries": 5,
         "fragment_retries": 5,
-        "extractor_retries": 3,
         "ignoreerrors": allow_playlist,
         "nocheckcertificate": True,
-        "geo_bypass": True,
+        # --- POT provider configuration ---
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "android", "ios"],
+                "player_client": ["web"],
+                "po_token": [f"web+{POT_PROVIDER_URL}"],
             }
         },
     }
@@ -242,7 +244,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔐 *YouTube blocked this download.*\n\n"
                 "The server's IP is being flagged by YouTube. The bot owner needs "
                 "to refresh the `YT_COOKIES_B64` environment variable with fresh "
-                "browser cookies."
+                "browser cookies, or check the POT provider logs."
             )
         elif "private video" in low:
             reply = "🔒 This video is private."
