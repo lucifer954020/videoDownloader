@@ -1,6 +1,5 @@
 FROM python:3.13-slim
 
-# Install ffmpeg (required by yt-dlp for MP3 conversion)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
