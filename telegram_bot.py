@@ -1,5 +1,7 @@
 import os
 import uuid
+import base64
+import tempfile
 import subprocess
 import asyncio
 import logging
@@ -22,6 +24,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)   # reduce log noise
 logger = logging.getLogger(__name__)
 
 # ---------- CONFIG ----------
@@ -30,10 +33,8 @@ if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN environment variable is not set!")
 
 DOWNLOAD_DIR = "./downloads"
-LOG_FILE = "logs.txt"
 MAX_TELEGRAM_SIZE_MB = 50
-DOWNLOAD_TIMEOUT_SEC = 900   # 15 min (playlists can be slow)
-
+DOWNLOAD_TIMEOUT_SEC = 1800   # 30 min for large playlists
 MODE_SINGLE = "single"
 MODE_PLAYLIST = "playlist"
 
@@ -75,14 +76,33 @@ def human_mb(path: str) -> float:
     return os.path.getsize(path) / (1024 * 1024)
 
 
-# ---------- DOWNLOAD (MP3, original names) ----------
+def write_cookies_file() -> str | None:
+    """Decode YT_COOKIES_B64 env var into a temp cookies.txt. Returns path or None."""
+    cookies_b64 = os.environ.get("YT_COOKIES_B64")
+    if not cookies_b64:
+        logger.warning("⚠️ YT_COOKIES_B64 not set — YouTube may block downloads.")
+        return None
+    try:
+        cookies_bytes = base64.b64decode(cookies_b64)
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="yt_cookies_")
+        with os.fdopen(fd, "wb") as f:
+            f.write(cookies_bytes)
+        logger.info("✅ YouTube cookies loaded.")
+        return path
+    except Exception as e:
+        logger.warning(f"Failed to decode cookies: {e}")
+        return None
+
+
+# ---------- DOWNLOAD ----------
 def download_audio(url: str, allow_playlist: bool) -> list:
-    """Download as MP3. Returns list of file paths. Raises on failure."""
+    """Download as MP3 using original titles. Returns list of file paths."""
     session_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4()))
     os.makedirs(session_dir, exist_ok=True)
 
+    cookies_path = write_cookies_file()
+
     ydl_opts = {
-        # %(title)s becomes the real song name. yt-dlp sanitises bad chars itself.
         "outtmpl": os.path.join(session_dir, "%(title)s.%(ext)s"),
         "format": "bestaudio/best",
         "postprocessors": [
@@ -96,14 +116,28 @@ def download_audio(url: str, allow_playlist: bool) -> list:
         "no_warnings": True,
         "noplaylist": not allow_playlist,
         "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
-        "ignoreerrors": allow_playlist,   # skip broken entries in playlists
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "ignoreerrors": allow_playlist,
         "nocheckcertificate": True,
+        "geo_bypass": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "android", "ios"],
+            }
+        },
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.extract_info(url, download=True)
+    if cookies_path:
+        ydl_opts["cookiefile"] = cookies_path
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=True)
+    finally:
+        if cookies_path:
+            safe_remove(cookies_path)
 
     mp3_files = []
     for name in sorted(os.listdir(session_dir)):
@@ -111,9 +145,11 @@ def download_audio(url: str, allow_playlist: bool) -> list:
             mp3_files.append(os.path.join(session_dir, name))
 
     if not mp3_files:
-        # Nothing downloaded — clean up and raise
         shutil.rmtree(session_dir, ignore_errors=True)
-        raise RuntimeError("No audio file was produced.")
+        raise RuntimeError(
+            "No audio file was produced. This usually means YouTube blocked the "
+            "download (cookies expired or missing) or the URL is invalid."
+        )
 
     return mp3_files
 
@@ -160,7 +196,7 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mode"] = MODE_PLAYLIST
         await query.edit_message_text(
             "📃 *Playlist mode.*\nNow send me a YouTube playlist link.\n"
-            "_(This can take a while for large playlists.)_",
+            "_(Large playlists can take a while.)_",
             parse_mode="Markdown",
         )
 
@@ -174,8 +210,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_valid_url(url):
         await update.message.reply_text(
-            "❌ That doesn't look like a valid link.\n"
-            "Please use /start to pick a mode and try again."
+            "❌ That doesn't look like a valid link. Use /start to pick a mode."
         )
         return
 
@@ -196,20 +231,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except asyncio.TimeoutError:
         await status.edit_text(
-            "❌ Download timed out. Try a shorter video or a smaller playlist."
+            "❌ Download timed out. Try a shorter video or smaller playlist."
         )
         return
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
         low = msg.lower()
-        if "private video" in low:
+        if "sign in to confirm" in low or "not a bot" in low:
+            reply = (
+                "🔐 *YouTube blocked this download.*\n\n"
+                "The server's IP is being flagged by YouTube. The bot owner needs "
+                "to refresh the `YT_COOKIES_B64` environment variable with fresh "
+                "browser cookies."
+            )
+        elif "private video" in low:
             reply = "🔒 This video is private."
         elif "age" in low and "restrict" in low:
             reply = "🔞 Age-restricted content."
         elif "unsupported url" in low:
             reply = "❌ This link is not supported."
         elif "ffmpeg" in low:
-            reply = "⚙️ Server is missing ffmpeg. Please redeploy with the Dockerfile."
+            reply = "⚙️ Server is missing ffmpeg. Redeploy with the Dockerfile."
         elif "video unavailable" in low or "not available" in low:
             reply = "🚫 Video unavailable (removed or region-locked)."
         else:
@@ -218,8 +260,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     except Exception as e:
         logger.exception("Download error")
-        await status.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:250]}`",
-                               parse_mode="Markdown")
+        await status.edit_text(
+            f"❌ Error: `{type(e).__name__}: {str(e)[:250]}`",
+            parse_mode="Markdown",
+        )
         return
 
     total = len(files)
@@ -234,7 +278,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if mb > MAX_TELEGRAM_SIZE_MB:
                 await update.message.reply_text(
-                    f"⚠️ Skipping *{title}* — {mb:.1f} MB (over Telegram's 50 MB limit).",
+                    f"⚠️ Skipping *{title}* — {mb:.1f} MB (over 50 MB limit).",
                     parse_mode="Markdown",
                 )
                 failed += 1
@@ -252,13 +296,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError as e:
             logger.warning(f"Telegram send failed for {path}: {e}")
             failed += 1
-        except Exception as e:
+        except Exception:
             logger.exception(f"Send error for {path}")
             failed += 1
         finally:
             safe_remove(path)
 
-    # Clean up session folder
     if files:
         session_dir = os.path.dirname(files[0])
         shutil.rmtree(session_dir, ignore_errors=True)
@@ -295,7 +338,7 @@ def main():
     if not check_ffmpeg():
         logger.warning(
             "⚠️ ffmpeg not found on PATH. MP3 conversion will fail. "
-            "Add a Dockerfile that installs ffmpeg."
+            "Ensure your Dockerfile installs ffmpeg."
         )
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
