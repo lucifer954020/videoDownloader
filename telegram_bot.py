@@ -9,7 +9,7 @@ import yt_dlp
 
 nest_asyncio.apply()
 
-BOT_TOKEN = '8188460122:AAFSIS7pRVbcpSyYn3BF7uDCUrj4DKk3dCE'  # Replace with your token
+BOT_TOKEN = '8512021280:AAEzC_BwI6KQM8OUwE88fSVTyc-CStuiahA'  # Replace with your token
 
 DOWNLOAD_DIR = "./downloads"
 LOG_FILE = "logs.txt"
